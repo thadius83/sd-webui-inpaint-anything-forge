@@ -1,51 +1,65 @@
-import gc
-import math
-import os
-import platform
+"""Inpaint‑Anything extension – fully working with Gradio 4.40+
 
+Only functional changes are marked with  ⚠  in comments.
+"""
+from __future__ import annotations
+import gc, math, os, platform, random, re, traceback
+from typing import Any, Dict, Optional, Tuple
+
+# ‑‑‑ Environment flags -------------------------------------------------------
 if platform.system() == "Darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
 if platform.system() == "Windows":
     os.environ["XFORMERS_FORCE_DISABLE_TRITON"] = "1"
 
-import random
-import re
-import traceback
-
-import cv2
-import gradio as gr
-import numpy as np
-import torch
-from diffusers import (DDIMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
-                       KDPM2AncestralDiscreteScheduler, KDPM2DiscreteScheduler,
-                       StableDiffusionInpaintPipeline)
-from modules import devices, script_callbacks, shared
-from modules.processing import create_infotext, process_images
-from modules.sd_models import get_closet_checkpoint_match
-from modules.sd_samplers import samplers_for_img2img
+# ‑‑‑ Standard libs -----------------------------------------------------------
+import cv2, numpy as np, gradio as gr, torch
 from PIL import Image, ImageFilter, ImageOps
 from PIL.PngImagePlugin import PngInfo
-from torch.hub import download_url_to_file
 from torchvision import transforms
 
-import inpalib
+# ‑‑‑ Web‑UI / diffusers ------------------------------------------------------
+from diffusers import (
+    DDIMScheduler,
+    EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,
+    KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler,
+    StableDiffusionInpaintPipeline,
+)
+from modules import devices, script_callbacks, shared
+from modules.sd_samplers import samplers_for_img2img
+from modules.processing import create_infotext, process_images
+from modules.sd_models import get_closet_checkpoint_match
+from gradio import ImageEditor, Brush
+
+# ‑‑‑ Local helpers -----------------------------------------------------------
+import inpalib  # segmentation + mask utils
 from ia_check_versions import ia_check_versions
-from ia_config import (IAConfig, get_ia_config_index, get_webui_setting, set_ia_config,
-                       setup_ia_config_ini)
-from ia_file_manager import IAFileManager, download_model_from_hf, ia_file_manager
-from ia_logging import draw_text_image, ia_logging
-from ia_threading import (async_post_reload_model_weights, await_backup_reload_ckpt_info,
-                          await_pre_reload_model_weights, clear_cache_decorator,
-                          offload_reload_decorator)
-from ia_ui_items import (get_cleaner_model_ids, get_inp_model_ids, get_inp_webui_model_ids,
-                         get_padding_mode_names, get_sam_model_ids, get_sampler_names)
-from ia_webui_controlnet import (backup_alwayson_scripts, clear_controlnet_cache,
-                                 disable_all_alwayson_scripts, disable_alwayson_scripts_wo_cn,
-                                 find_controlnet, get_controlnet_args_to, get_max_args_to,
-                                 get_sd_img2img_processing, restore_alwayson_scripts)
+from ia_config import (
+    IAConfig, setup_ia_config_ini, set_ia_config, get_ia_config_index,
+    get_webui_setting,
+)
+from ia_file_manager import IAFileManager, ia_file_manager, download_model_from_hf
+from ia_logging import ia_logging, draw_text_image
+from ia_threading import (
+    clear_cache_decorator, offload_reload_decorator,
+    async_post_reload_model_weights, await_backup_reload_ckpt_info,
+    await_pre_reload_model_weights,
+)
+from ia_ui_items import (
+    get_sam_model_ids, get_inp_model_ids, get_cleaner_model_ids,
+    get_inp_webui_model_ids, get_padding_mode_names, get_sampler_names,
+)
+from ia_webui_controlnet import (
+    find_controlnet, get_sd_img2img_processing, get_controlnet_args_to,
+    get_max_args_to, backup_alwayson_scripts, disable_alwayson_scripts_wo_cn,
+    disable_all_alwayson_scripts, clear_controlnet_cache, restore_alwayson_scripts,
+)
 from lama_cleaner.model_manager import ModelManager
 from lama_cleaner.schema import Config, HDStrategy, LDMSampler, SDSampler
+
+CANVAS_W, CANVAS_H = int(768 * 1.30), int(576 * 1.30)   # ~= 998 × 749
+PAD = 20                                                # white border
+
 
 
 @clear_cache_decorator
@@ -82,6 +96,62 @@ def download_model(sam_model_id):
         return "Model already exists"
 
 
+# -----------------------------------------------------------------------------
+# ⚠  NEW — robust mask extraction for Gradio 4.40+
+# -----------------------------------------------------------------------------
+
+def _to_ndarray(layer: Any) -> np.ndarray:
+    """Convert PIL.Image → np.ndarray; leave ndarray untouched."""
+    if isinstance(layer, Image.Image):
+        return np.array(layer)
+    return layer
+
+def extract_mask_from_image_editor(val: Any) -> Optional[np.ndarray]:
+    """Return an H×W×1 uint8 mask (255 = painted pixel) or None."""
+    if val is None:
+        return None
+
+    # ── 4.x format ───────────────────────────────────────────────────────────
+    if isinstance(val, dict):
+        # 1️⃣ explicit layers list
+        if val.get("layers"):
+            alphas = []
+            for L in val["layers"]:
+        # NEW ↓ honour dict-with-"data" as produced by Brush in Gradio ≥4.4
+                if isinstance(L, dict) and "data" in L:
+                    arr = _to_ndarray(L["data"])
+                else:
+                    arr = _to_ndarray(L)
+        # ------------------------------------------------------
+                if arr.ndim == 3 and arr.shape[2] == 4:        # RGBA
+                    alphas.append(arr[:, :, 3])
+                else:                                          # RGB fallback
+                    gray = np.mean(arr[..., :3], 2)
+                    alphas.append((gray > 0).astype(np.uint8) * 255)    
+            
+            if alphas:
+                m = (np.max(alphas, 0) > 0).astype(np.uint8) * 255
+                return m[:, :, None]
+
+        # 2️⃣ single‑layer shortcut: composite key
+        if isinstance(val.get("composite"), (np.ndarray, Image.Image)):
+            comp = _to_ndarray(val["composite"])
+            if comp.ndim == 3 and comp.shape[2] == 4:
+                return comp[:, :, 3:4]
+            gray = np.mean(comp[..., :3], 2)
+            return ((gray > 0).astype(np.uint8) * 255)[:, :, None]
+
+        # 3️⃣ legacy key hosted inside new dict
+        if "mask" in val and isinstance(val["mask"], np.ndarray):
+            m = val["mask"]
+            return m[:, :, None] if m.ndim == 2 else m
+
+    # ── pure ndarray (old Gradio ≤ 3.44) ─────────────────────────────────────
+    if isinstance(val, np.ndarray):
+        return val[:, :, None] if val.ndim == 2 else val
+
+    return None
+
 sam_dict = dict(sam_masks=None, mask_image=None, cnet=None, orig_image=None, pad_mask=None)
 
 
@@ -113,23 +183,68 @@ def input_image_upload(input_image, sam_image, sel_mask):
 
     ret_sel_image = cv2.addWeighted(input_image, 0.5, sam_dict["mask_image"], 0.5, 0)
 
-    if sam_image is None or not isinstance(sam_image, dict) or "image" not in sam_image:
+    # Handle Gradio 4+ ImageEditor output
+    if sam_image is None:
         sam_dict["sam_masks"] = None
         ret_sam_image = np.zeros_like(input_image, dtype=np.uint8)
-    elif sam_image["image"].shape == input_image.shape:
-        ret_sam_image = gr.update()
+    elif isinstance(sam_image, dict) and "background" in sam_image:
+        # For Gradio 4+
+        if sam_image["background"].shape == input_image.shape:
+            ret_sam_image = gr.update()
+        else:
+            sam_dict["sam_masks"] = None
+            ret_sam_image = gr.update(value=np.zeros_like(input_image, dtype=np.uint8))
+    elif isinstance(sam_image, dict) and "image" in sam_image:
+        # For old Gradio
+        if sam_image["image"].shape == input_image.shape:
+            ret_sam_image = gr.update()
+        else:
+            sam_dict["sam_masks"] = None
+            ret_sam_image = gr.update(value=np.zeros_like(input_image, dtype=np.uint8))
     else:
         sam_dict["sam_masks"] = None
         ret_sam_image = gr.update(value=np.zeros_like(input_image, dtype=np.uint8))
 
-    if sel_mask is None or not isinstance(sel_mask, dict) or "image" not in sel_mask:
+    # Handle sel_mask with either Gradio format
+    if sel_mask is None:
         ret_sel_mask = ret_sel_image
-    elif sel_mask["image"].shape == ret_sel_image.shape and np.all(sel_mask["image"] == ret_sel_image):
-        ret_sel_mask = gr.update()
+    elif isinstance(sel_mask, dict) and "image" in sel_mask:
+        # Old Gradio format
+        if sel_mask["image"].shape == ret_sel_image.shape and np.all(sel_mask["image"] == ret_sel_image):
+            ret_sel_mask = gr.update()
+        else:
+            ret_sel_mask = gr.update(value=ret_sel_image)
+    elif isinstance(sel_mask, dict) and "background" in sel_mask:
+        # Gradio 4+ format
+        if sel_mask["background"].shape == ret_sel_image.shape:
+            ret_sel_mask = gr.update()
+        else:
+            ret_sel_mask = gr.update(value=ret_sel_image)
     else:
         ret_sel_mask = gr.update(value=ret_sel_image)
 
     return ret_sam_image, ret_sel_mask, gr.update(interactive=True)
+
+# Function to resize an image to fit within a specified dimension while maintaining aspect ratio
+def resize_image_to_fit(image, 
+                        max_width=CANVAS_W + 2*PAD,
+                        max_height=CANVAS_H + 2*PAD):
+                        
+    if image is None:
+        return None
+        
+    height, width = image.shape[:2]
+    
+    # Calculate the scaling factor - always scale to fit exactly within the canvas
+    # This ensures consistent behavior regardless of window size
+    scale_width = max_width / width
+    scale_height = max_height / height
+    scale = min(scale_width, scale_height)
+    
+    # Always resize to ensure consistent size across all editors
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
 
 @clear_cache_decorator
@@ -202,52 +317,160 @@ def run_sam(input_image, sam_model_id, sam_image, anime_style_chk=False):
         ret_sam_image = None if sam_image is None else gr.update()
         return ret_sam_image, "Segment Anything failed"
 
-    if sam_image is None or not isinstance(sam_image, dict) or "image" not in sam_image:
-        return seg_image, "Segment Anything complete"
+    # Resize the segmentation image to fit in the window
+    resized_seg_image = resize_image_to_fit(seg_image)
+    
+    # Handle different Gradio output formats
+    if sam_image is None:
+        return resized_seg_image, "Segment Anything complete"
+    elif isinstance(sam_image, dict) and "background" in sam_image:
+        # Gradio 4+ format
+        return gr.update(value=resized_seg_image), "Segment Anything complete"
+    elif isinstance(sam_image, dict) and "image" in sam_image:
+        # Old Gradio format
+        return gr.update(value=resized_seg_image), "Segment Anything complete"
     else:
-        if sam_image["image"].shape == seg_image.shape and np.all(sam_image["image"] == seg_image):
-            return gr.update(), "Segment Anything complete"
-        else:
-            return gr.update(value=seg_image), "Segment Anything complete"
+        # Fallback
+        return gr.update(value=resized_seg_image), "Segment Anything complete"
 
 
 @clear_cache_decorator
+
 def select_mask(input_image, sam_image, invert_chk, ignore_black_chk, sel_mask):
     global sam_dict
+    # If nothing segmented yet, clear the preview
     if sam_dict["sam_masks"] is None or sam_image is None:
-        ret_sel_mask = None if sel_mask is None else gr.update()
-        return ret_sel_mask
+        ia_logging.info("No segmentation masks available or sam_image is None")
+        return None if sel_mask is None else gr.update()
+    
     sam_masks = sam_dict["sam_masks"]
-
-    # image = sam_image["image"]
-    mask = sam_image["mask"][:, :, 0:1]
-
+    
+    # Extract mask using the helper function
+    mask = extract_mask_from_image_editor(sam_image)
+    
+    # Add diagnostic logging to help debug mask issues
+    if mask is None or not mask.any():
+        ia_logging.warning("Empty mask extracted – check editor output!")
+        # Create an empty mask based on background if possible
+        if isinstance(sam_image, dict) and "background" in sam_image:
+            background = _to_ndarray(sam_image["background"])
+            mask = np.zeros((background.shape[0], background.shape[1], 1), dtype=np.uint8)
+            ia_logging.info(f"Created empty mask with shape {mask.shape}")
+    else:
+        ia_logging.info(f"Extracted mask with shape {mask.shape}, non-zero pixels: {np.count_nonzero(mask)}")
+    
+    # Get the original image - this is the full resolution image we need to match
+    orig_image = sam_dict["orig_image"]
+    if orig_image is None:
+        ia_logging.error("Original image not found")
+        return None if sel_mask is None else gr.update()
+    
+    # If we couldn't extract a mask, create an empty one based on display dimensions
+    if mask is None:
+        if isinstance(sam_image, dict) and "background" in sam_image:
+            background = _to_ndarray(sam_image["background"])
+            height, width = background.shape[:2]
+        elif isinstance(sam_image, np.ndarray):
+            height, width = sam_image.shape[:2]
+        else:
+            # If we can't determine dimensions, return without updating
+            ia_logging.error("Could not determine mask dimensions")
+            return None if sel_mask is None else gr.update()
+            
+        mask = np.zeros((height, width, 1), dtype=np.uint8)
+    
+    # Get dimensions of mask and original image
+    orig_height, orig_width = orig_image.shape[:2]
+    mask_height, mask_width = mask.shape[:2]
+    
+    ia_logging.info(f"Original image: {orig_width}x{orig_height}, Mask: {mask_width}x{mask_height}")
+    
     try:
-        seg_image = inpalib.create_mask_image(mask, sam_masks, ignore_black_chk)
+        # If dimensions don't match, resize mask to match the original image
+        if mask_height != orig_height or mask_width != orig_width:
+            ia_logging.info(f"Resizing mask from {mask_width}x{mask_height} to {orig_width}x{orig_height}")
+            mask_resized = cv2.resize(mask, (orig_width, orig_height), interpolation=cv2.INTER_NEAREST)
+            if len(mask_resized.shape) == 2:
+                mask_resized = mask_resized[:, :, np.newaxis]
+        else:
+            mask_resized = mask
+        
+        # Create mask with properly sized inputs
+        seg_image = inpalib.create_mask_image(mask_resized, sam_masks, ignore_black_chk)
         if invert_chk:
             seg_image = inpalib.invert_mask(seg_image)
-
         sam_dict["mask_image"] = seg_image
+        
+        # Resize the result back for display
+        if mask_height != orig_height or mask_width != orig_width:
+            display_seg_image = cv2.resize(seg_image, (mask_width, mask_height), interpolation=cv2.INTER_AREA)
+        else:
+            display_seg_image = seg_image
+    except Exception as e:
+        ia_logging.error(f"Error creating mask: {str(e)}")
+        ia_logging.error(traceback.format_exc())
+        return None if sel_mask is None else gr.update()
+    
+    # Initialize ret to default value in case of any errors
+    ret = display_seg_image
+    
+    try:
+        disp_h, disp_w = display_seg_image.shape[:2]
+
+        if input_image is None:
+            ia_logging.info("Preview-overlay: input_image is None → show mask only")
+            ret = display_seg_image
+        else:
+            # ----- make sure base image matches preview size ----------------------
+            if input_image.shape[:2] != (disp_h, disp_w):
+                ia_logging.info(
+                    f"Preview-overlay: resizing base from "
+                    f"{input_image.shape[:2]} → {(disp_h, disp_w)}"
+                )
+                base = cv2.resize(
+                    input_image, (disp_w, disp_h), interpolation=cv2.INTER_AREA
+                )
+            else:
+                base = input_image
+
+            # ----- build boolean mask for overlay  ---------------------------
+            # Always take the *final* stored mask (sam_dict["mask_image"]):
+            try:
+                full_mask = sam_dict["mask_image"]               # H×W×3   255 = selected
+                if full_mask.ndim == 3:
+                    full_mask = full_mask[:, :, 0]               # any channel is fine
+
+                # resize it to the preview size so shapes match
+                mask_disp = cv2.resize(
+                    full_mask,
+                    (disp_w, disp_h),
+                    interpolation=cv2.INTER_NEAREST
+                ) > 0                                            # boolean
+
+            except Exception as e:
+                ia_logging.error(f"Could not build preview mask: {e}")
+                mask_disp = np.zeros((disp_h, disp_w), bool)
+
+            # ----- compose --------------------------------------------------------
+            overlay = base.copy()
+            red     = np.zeros_like(overlay)
+            red[:, :, 0] = 255                    # pure red
+            alpha = 0.45
+
+            overlay[mask_disp] = (
+                alpha * red[mask_disp] + (1 - alpha) * overlay[mask_disp]
+            ).astype(np.uint8)
+
+            ret = overlay
 
     except Exception as e:
-        print(traceback.format_exc())
-        ia_logging.error(str(e))
-        ret_sel_mask = None if sel_mask is None else gr.update()
-        return ret_sel_mask
+        # Any unexpected shape issue ⇒ fall back to the plain mask & log the error
+        ia_logging.error(f"Preview-overlay failure: {e}")
+        ia_logging.error(traceback.format_exc())
+        # ret is already set to display_seg_image as default
 
-    if input_image is not None and input_image.shape == seg_image.shape:
-        ret_image = cv2.addWeighted(input_image, 0.5, seg_image, 0.5, 0)
-    else:
-        ret_image = seg_image
-
-    if sel_mask is None or not isinstance(sel_mask, dict) or "image" not in sel_mask:
-        return ret_image
-    else:
-        if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
-            return gr.update()
-        else:
-            return gr.update(value=ret_image)
-
+    # Update the Gradio preview
+    return ret if not (isinstance(sel_mask, dict) and sel_mask.get("image") is ret) else gr.update()
 
 @clear_cache_decorator
 def expand_mask(input_image, sel_mask, expand_iteration=1):
@@ -268,10 +491,15 @@ def expand_mask(input_image, sel_mask, expand_iteration=1):
     else:
         ret_image = new_sel_mask
 
-    if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
-        return gr.update()
-    else:
-        return gr.update(value=ret_image)
+    # Check if we need to update based on the format
+    if isinstance(sel_mask, dict) and "image" in sel_mask:
+        if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
+            return gr.update()
+    elif isinstance(sel_mask, dict) and "background" in sel_mask:
+        # For Gradio 4+ format, we just return an update with the new value
+        pass
+        
+    return gr.update(value=ret_image)
 
 
 @clear_cache_decorator
@@ -281,7 +509,16 @@ def apply_mask(input_image, sel_mask):
         return None
 
     sel_mask_image = sam_dict["mask_image"]
-    sel_mask_mask = np.logical_not(sel_mask["mask"][:, :, 0:3].astype(bool)).astype(np.uint8)
+    
+    # Extract mask using the helper function
+    user_mask = extract_mask_from_image_editor(sel_mask)
+    
+    if user_mask is None:
+        ia_logging.error("Could not extract mask from image editor output")
+        return gr.update()
+    
+    # Invert the mask for trim operation
+    sel_mask_mask = np.logical_not(user_mask[:, :, 0:3].astype(bool)).astype(np.uint8)
     new_sel_mask = sel_mask_image * sel_mask_mask
 
     sam_dict["mask_image"] = new_sel_mask
@@ -291,10 +528,12 @@ def apply_mask(input_image, sel_mask):
     else:
         ret_image = new_sel_mask
 
-    if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
-        return gr.update()
-    else:
-        return gr.update(value=ret_image)
+    # Check if we need to update
+    if isinstance(sel_mask, dict) and "image" in sel_mask:
+        if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
+            return gr.update()
+    
+    return gr.update(value=ret_image)
 
 
 @clear_cache_decorator
@@ -304,7 +543,16 @@ def add_mask(input_image, sel_mask):
         return None
 
     sel_mask_image = sam_dict["mask_image"]
-    sel_mask_mask = sel_mask["mask"][:, :, 0:3].astype(bool).astype(np.uint8)
+    
+    # Extract mask using the helper function
+    user_mask = extract_mask_from_image_editor(sel_mask)
+    
+    if user_mask is None:
+        ia_logging.error("Could not extract mask from image editor output")
+        return gr.update()
+        
+    # Use the mask for addition operation
+    sel_mask_mask = user_mask[:, :, 0:3].astype(bool).astype(np.uint8)
     new_sel_mask = sel_mask_image + (sel_mask_mask * np.invert(sel_mask_image, dtype=np.uint8))
 
     sam_dict["mask_image"] = new_sel_mask
@@ -314,10 +562,12 @@ def add_mask(input_image, sel_mask):
     else:
         ret_image = new_sel_mask
 
-    if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
-        return gr.update()
-    else:
-        return gr.update(value=ret_image)
+    # Check if we need to update
+    if isinstance(sel_mask, dict) and "image" in sel_mask:
+        if sel_mask["image"].shape == ret_image.shape and np.all(sel_mask["image"] == ret_image):
+            return gr.update()
+    
+    return gr.update(value=ret_image)
 
 
 def auto_resize_to_pil(input_image, mask_image):
@@ -561,9 +811,12 @@ def run_get_alpha_image(input_image, sel_mask):
         return None, ""
 
     alpha_image = Image.fromarray(input_image).convert("RGBA")
-    mask_image = Image.fromarray(mask_image).convert("L")
-
-    alpha_image.putalpha(mask_image)
+    #mask_image = Image.fromarray(mask_image).convert("L")
+    mask_binary = Image.fromarray(mask_image).convert("L")
+    # ⚠  Invert so that masked pixels become transparent
+    mask_binary = ImageOps.invert(mask_binary)
+    alpha_image.putalpha(mask_binary)
+    #alpha_image.putalpha(mask_image)
 
     save_name = "_".join([ia_file_manager.savename_prefix, "rgba_image"]) + ".png"
     save_name = os.path.join(ia_file_manager.outputs_dir, save_name)
@@ -579,6 +832,7 @@ def run_get_mask(sel_mask):
         return None
 
     mask_image = sam_dict["mask_image"]
+    #mask_image = cv2.bitwise_not(sam_dict["mask_image"])
 
     save_name = "_".join([ia_file_manager.savename_prefix, "created_mask"]) + ".png"
     save_name = os.path.join(ia_file_manager.outputs_dir, save_name)
@@ -888,9 +1142,10 @@ def on_ui_tabs():
         webui_sampler_ids = ["DDIM"]
     webui_sampler_index = webui_sampler_ids.index("DDIM") if "DDIM" in webui_sampler_ids else 0
 
-    out_gallery_kwargs = dict(columns=2, height=520, object_fit="contain", preview=True)
+    # Gradio 4 gallery parameters used across multiple components
+    out_gallery_kwargs = dict(columns=2, height=480, object_fit="contain", preview=True, allow_preview=True)
 
-    with gr.Blocks(analytics_enabled=False) as inpaint_anything_interface:
+    with gr.Blocks(analytics_enabled=False, theme=gr.themes.Default()) as inpaint_anything_interface:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
@@ -969,12 +1224,9 @@ def on_ui_tabs():
                                 iteration_count = gr.Slider(label="Iterations", elem_id="iteration_count", minimum=1, maximum=10, value=1, step=1)
 
                     with gr.Row():
-                        if ia_check_versions.gradio_version_is_old:
-                            out_image = gr.Gallery(label="Inpainted image", elem_id="ia_out_image", show_label=False
-                                                   ).style(**out_gallery_kwargs)
-                        else:
-                            out_image = gr.Gallery(label="Inpainted image", elem_id="ia_out_image", show_label=False,
-                                                   **out_gallery_kwargs)
+                        # Use only the modern Gradio 4 Gallery syntax
+                        out_image = gr.Gallery(label="Inpainted image", elem_id="ia_out_image", show_label=False,
+                                               **out_gallery_kwargs)
 
                 with gr.Tab("Cleaner", elem_id="cleaner_tab"):
                     with gr.Row():
@@ -989,12 +1241,9 @@ def on_ui_tabs():
                                                                     value=False, show_label=False, interactive=False, visible=False)
 
                     with gr.Row():
-                        if ia_check_versions.gradio_version_is_old:
-                            cleaner_out_image = gr.Gallery(label="Cleaned image", elem_id="ia_cleaner_out_image", show_label=False
-                                                           ).style(**out_gallery_kwargs)
-                        else:
-                            cleaner_out_image = gr.Gallery(label="Cleaned image", elem_id="ia_cleaner_out_image", show_label=False,
-                                                           **out_gallery_kwargs)
+                        # Use only the modern Gradio 4 Gallery syntax
+                        cleaner_out_image = gr.Gallery(label="Cleaned image", elem_id="ia_cleaner_out_image", show_label=False,
+                                                       **out_gallery_kwargs)
 
                 if webui_inpaint_enabled:
                     with gr.Tab("Inpainting webui", elem_id="webui_inpainting_tab"):
@@ -1053,12 +1302,9 @@ def on_ui_tabs():
                                                                       minimum=1, maximum=10, value=1, step=1)
 
                         with gr.Row():
-                            if ia_check_versions.gradio_version_is_old:
-                                webui_out_image = gr.Gallery(label="Inpainted image", elem_id="ia_webui_out_image", show_label=False
-                                                             ).style(**out_gallery_kwargs)
-                            else:
-                                webui_out_image = gr.Gallery(label="Inpainted image", elem_id="ia_webui_out_image", show_label=False,
-                                                             **out_gallery_kwargs)
+                            # Use only the modern Gradio 4 Gallery syntax
+                            webui_out_image = gr.Gallery(label="Inpainted image", elem_id="ia_webui_out_image", show_label=False,
+                                                         **out_gallery_kwargs)
 
                 with gr.Tab("ControlNet Inpaint", elem_id="cn_inpaint_tab"):
                     if cn_enabled:
@@ -1143,12 +1389,9 @@ def on_ui_tabs():
                                                                    minimum=1, maximum=10, value=1, step=1)
 
                         with gr.Row():
-                            if ia_check_versions.gradio_version_is_old:
-                                cn_out_image = gr.Gallery(label="Inpainted image", elem_id="ia_cn_out_image", show_label=False
-                                                          ).style(**out_gallery_kwargs)
-                            else:
-                                cn_out_image = gr.Gallery(label="Inpainted image", elem_id="ia_cn_out_image", show_label=False,
-                                                          **out_gallery_kwargs)
+                            # Use only the modern Gradio 4 Gallery syntax
+                            cn_out_image = gr.Gallery(label="Inpainted image", elem_id="ia_cn_out_image", show_label=False,
+                                                      **out_gallery_kwargs)
 
                     else:
                         if sam_dict["cnet"] is None:
@@ -1185,14 +1428,27 @@ def on_ui_tabs():
             with gr.Column():
                 with gr.Row():
                     gr.Markdown("Mouse over image: Press `S` key for Fullscreen mode, `R` key to Reset zoom")
-                with gr.Row():
-                    if ia_check_versions.gradio_version_is_old:
-                        sam_image = gr.Image(label="Segment Anything image", elem_id="ia_sam_image", type="numpy", tool="sketch", brush_radius=8,
-                                             show_label=False, interactive=True).style(height=480)
-                    else:
-                        sam_image = gr.Image(label="Segment Anything image", elem_id="ia_sam_image", type="numpy", tool="sketch", brush_radius=8,
-                                             show_label=False, interactive=True, height=480)
 
+                # ─── SAM segmentation canvas ─────────────────────────
+                with gr.Row():
+                    brush_sam = Brush(default_size=8, default_color="black", colors=["black","white"])
+                    sam_image = ImageEditor(
+                        label="Segment Anything image",
+                        elem_id="ia_sam_image",
+                        type="numpy",
+                        brush=Brush(               # ← give it any Brush() to expose the tool
+                            default_size=8,
+                            default_color="white",
+                            colors=["white", "black", "red", "green", "blue"]
+                            ),
+                        show_label=False,
+                        interactive=True,
+                        height=CANVAS_H + 2*PAD,  # 30px padding on each side
+                        canvas_size=(CANVAS_W + 2*PAD, CANVAS_H + 2*PAD),  # 30px padding on each side
+                        image_mode="RGBA"
+                    )
+
+                # ─── Mask controls ────────────────────────────────────
                 with gr.Row():
                     with gr.Column():
                         select_btn = gr.Button("Create Mask", elem_id="select_btn", variant="primary")
@@ -1201,13 +1457,20 @@ def on_ui_tabs():
                             invert_chk = gr.Checkbox(label="Invert mask", elem_id="invert_chk", show_label=True, interactive=True)
                             ignore_black_chk = gr.Checkbox(label="Ignore black area", elem_id="ignore_black_chk", value=True, show_label=True, interactive=True)
 
+                # ─── Mask preview canvas ─────────────────────────────
                 with gr.Row():
-                    if ia_check_versions.gradio_version_is_old:
-                        sel_mask = gr.Image(label="Selected mask image", elem_id="ia_sel_mask", type="numpy", tool="sketch", brush_radius=12,
-                                            show_label=False, interactive=True).style(height=480)
-                    else:
-                        sel_mask = gr.Image(label="Selected mask image", elem_id="ia_sel_mask", type="numpy", tool="sketch", brush_radius=12,
-                                            show_label=False, interactive=True, height=480)
+                    brush_sel = Brush(default_size=12, default_color="black", colors=["black","white"])
+                    sel_mask = ImageEditor(
+                        label="Selected mask image",
+                        elem_id="ia_sel_mask",
+                        type="numpy",
+                        brush=brush_sel,
+                        show_label=False,
+                        interactive=True,
+                        height=CANVAS_H + 2*PAD,  # 30px padding on each side
+                        canvas_size=(CANVAS_W + 2*PAD, CANVAS_H + 2*PAD),  # 30px padding on each side
+                        image_mode="RGBA"
+                    )
 
                 with gr.Row():
                     with gr.Column():
@@ -1219,20 +1482,136 @@ def on_ui_tabs():
                         add_mask_btn = gr.Button("Add mask by sketch", elem_id="add_mask_btn")
 
             load_model_btn.click(download_model, inputs=[sam_model_id], outputs=[status_text])
-            input_image.upload(input_image_upload, inputs=[input_image, sam_image, sel_mask], outputs=[sam_image, sel_mask, sam_btn]).then(
-                fn=None, inputs=None, outputs=None, _js="inpaintAnything_initSamSelMask")
-            padding_btn.click(run_padding, inputs=[input_image, pad_scale_width, pad_scale_height, pad_lr_barance, pad_tb_barance, padding_mode],
-                              outputs=[input_image, status_text])
-            sam_btn.click(run_sam, inputs=[input_image, sam_model_id, sam_image, anime_style_chk], outputs=[sam_image, status_text]).then(
-                fn=None, inputs=None, outputs=None, _js="inpaintAnything_clearSamMask")
-            select_btn.click(select_mask, inputs=[input_image, sam_image, invert_chk, ignore_black_chk, sel_mask], outputs=[sel_mask]).then(
-                fn=None, inputs=None, outputs=None, _js="inpaintAnything_clearSelMask")
-            expand_mask_btn.click(expand_mask, inputs=[input_image, sel_mask, expand_mask_iteration_count], outputs=[sel_mask]).then(
-                fn=None, inputs=None, outputs=None, _js="inpaintAnything_clearSelMask")
-            apply_mask_btn.click(apply_mask, inputs=[input_image, sel_mask], outputs=[sel_mask]).then(
-                fn=None, inputs=None, outputs=None, _js="inpaintAnything_clearSelMask")
-            add_mask_btn.click(add_mask, inputs=[input_image, sel_mask], outputs=[sel_mask]).then(
-                fn=None, inputs=None, outputs=None, _js="inpaintAnything_clearSelMask")
+            # Main workflow events
+            # When input image changes, update both image editors with properly resized images
+            def prepare_images_for_editors(img):
+                if img is None:
+                    return None, None, gr.update(interactive=False)
+                
+                # Store original image for processing
+                sam_dict["orig_image"] = img
+                
+                # Create empty mask of the same size
+                if sam_dict["mask_image"] is None or sam_dict["mask_image"].shape != img.shape:
+                    sam_dict["mask_image"] = np.zeros_like(img, dtype=np.uint8)
+                
+                # Resize the image to fit the editor while maintaining aspect ratio
+                # Always resize to ensure consistent behavior across all editors
+                resized_img = resize_image_to_fit(img)
+                
+                # Create a resized mask for overlay
+                resized_mask = np.zeros_like(resized_img, dtype=np.uint8)
+                
+                # Overlay for sel_mask - use resized versions for display
+                overlay = cv2.addWeighted(resized_img, 0.5, resized_mask, 0.5, 0)
+                
+                # We return the same sized images for both editors to ensure consistency
+                return resized_img, resized_img, gr.update(interactive=True)
+            
+            # Define a JavaScript function to ensure all canvases are properly resized
+            resize_js = """
+function() {
+    // Force a resize event to ensure all canvases are properly updated
+    setTimeout(function() {
+        window.dispatchEvent(new Event('resize'));
+    }, 100);
+    return [];
+}
+"""
+            
+            # Use the same function for both change and upload events
+            input_image.change(
+                fn=prepare_images_for_editors,
+                inputs=[input_image],
+                outputs=[sam_image, sel_mask, sam_btn]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_initSamSelMask"
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js=resize_js
+            )
+            
+            input_image.upload(
+                fn=prepare_images_for_editors,
+                inputs=[input_image],
+                outputs=[sam_image, sel_mask, sam_btn]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_initSamSelMask"
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js=resize_js
+            )
+            
+            padding_btn.click(
+                run_padding,
+                inputs=[input_image, pad_scale_width, pad_scale_height, pad_lr_barance, pad_tb_barance, padding_mode],
+                outputs=[input_image, status_text]
+            )
+            
+            sam_btn.click(
+                run_sam,
+                inputs=[input_image, sam_model_id, sam_image, anime_style_chk],
+                outputs=[sam_image, status_text]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_clearSamMask"
+            )
+            
+            select_btn.click(
+                select_mask,
+                inputs=[input_image, sam_image, invert_chk, ignore_black_chk, sel_mask],
+                outputs=[sel_mask]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_clearSelMask"
+            )
+            
+            expand_mask_btn.click(
+                expand_mask,
+                inputs=[input_image, sel_mask, expand_mask_iteration_count],
+                outputs=[sel_mask]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_clearSelMask"
+            )
+            
+            apply_mask_btn.click(
+                apply_mask,
+                inputs=[input_image, sel_mask],
+                outputs=[sel_mask]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_clearSelMask"
+            )
+            
+            add_mask_btn.click(
+                add_mask,
+                inputs=[input_image, sel_mask],
+                outputs=[sel_mask]
+            ).then(
+                fn=None,
+                inputs=None,
+                outputs=None,
+                _js="inpaintAnything_clearSelMask"
+            )
             get_txt2img_prompt_btn.click(
                 fn=None, inputs=None, outputs=None, _js="inpaintAnything_getTxt2imgPrompt")
             get_img2img_prompt_btn.click(

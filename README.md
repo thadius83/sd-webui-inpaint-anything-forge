@@ -1,28 +1,50 @@
-# Inpaint Anything for Stable Diffusion Web UI
+# Inpaint Anything for Stable Diffusion Web UI Forge
 
-Inpaint Anything extension performs stable diffusion inpainting on a browser UI using any mask selected from the output of [Segment Anything](https://github.com/facebookresearch/segment-anything).
+This is a specialized fork of the Inpaint Anything extension **specifically optimized for [SD WebUI Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge)** with Gradio ≥ 4.40.
 
+## What Was Fixed in This Fork
+
+- **Mask Extraction**: New `extract_mask_from_image_editor()` function handles all Gradio 4.x output formats (layers/composite/legacy)
+- **Preview Rendering**: Safe resize of base images and masks, red-tint overlay instead of black/white, improved logging
+- **Mask-Only Tab**: Inverted mask before stamping into alpha so photos show correctly
+- **Robustness**: Fixed shape mismatches and null pointer errors, properly initialized values to prevent crashes
+- **Canvas Resizing**: JavaScript helper added to force redraw on window resize
+
+### Key Improvements
+
+- Colored segmentation previews now work correctly
+- Brush tool properly extracts binary masks with the new helper
+- Create Mask function properly merges brush + SAM segment masks
+- Red transparent overlay makes selections more visible
+- Exported masks correctly display in both raw format and as alpha channel
+
+### Tested On
+- Ubuntu 22.04 (Python 3.10, torch 2.2, CUDA 12.2)
+- NVIDIA RTX 4090 & CPU-only runs
+- Gradio 4.40.1
+
+## About Inpaint Anything
+
+Inpaint Anything performs stable diffusion inpainting on a browser UI using any mask selected from the output of [Segment Anything](https://github.com/facebookresearch/segment-anything).
 
 Using Segment Anything enables users to specify masks by simply pointing to the desired areas, instead of manually filling them in. This can increase the efficiency and accuracy of the mask creation process, leading to potentially higher-quality inpainting results while saving time and effort.
 
-[Standalone version](https://github.com/Uminosachi/inpaint-anything)
+[Original version by Uminosachi](https://github.com/Uminosachi/inpaint-anything)
 
 ## Installation
 
 To install the software, please follow these steps:
 
-* Open the `Extensions` tab on the AUTOMATIC1111's [Stable Diffusion Web UI](https://github.com/AUTOMATIC1111/stable-diffusion-webui.git).
+* Open the `Extensions` tab on the [Stable Diffusion Web UI Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge).
 * Select the `Install from URL` option.
-* Enter `https://github.com/Uminosachi/sd-webui-inpaint-anything.git` in the `URL for extension's git repository` field.
+* Enter `https://github.com/thadius83/sd-webui-inpaint-anything-forge.git` in the `URL for extension's git repository` field.
 * Click on the `Install` button.
 * Once installation is complete, restart the Web UI.
-* Note: This extension supports v1.3.0 or higher of AUTOMATIC1111's Stable Diffusion Web UI.
 
 ## Running the application
 
 * If you intend to use the memory-efficient xformers, please append the `--xformers` argument to your startup command. For example, run `./webui.sh --xformers` or `webui.bat --xformers`
 * Note: If you have a privacy protection extension enabled in your web browser, such as DuckDuckGo, you may not be able to retrieve the mask from your sketch.
-* Note: In Gradio version 3.23.0 or older, the segmentation image may appear small on the Web UI.
 
 ## Downloading the Model
 

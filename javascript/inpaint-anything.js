@@ -1,22 +1,25 @@
+/* Inpaint‑Anything helpers patched for Gradio 4.40+                       */
+/* Only selectors / MutationObserver tweaks changed – see   ⚠  markers.   */
+
+// ‑‑‑ Utility helpers ---------------------------------------------------------
+const root = () => document.querySelector("gradio-app")?.shadowRoot || document;
+
+const waitForEl = (parent, selector, mustExist = true) =>
+  new Promise(res => {
+    const ok = () => !!parent.querySelector(selector) === mustExist;
+    if (ok()) return res();
+    const obs = new MutationObserver(() => ok() && (obs.disconnect(), res()));
+    obs.observe(parent, { childList: true, subtree: true, attributes: true }); // ⚠ attr
+  });
+
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// ‑‑‑ Button helpers (language‑agnostic) -------------------------------------
+const queryBtn = (el, rx) =>
+  [...el.querySelectorAll('button[aria-label]')].find(b => rx.test(b.ariaLabel)); // ⚠ regex
+
 const inpaintAnything_waitForElement = async (parent, selector, exist) => {
-    return new Promise((resolve) => {
-        const observer = new MutationObserver(() => {
-            if (!!parent.querySelector(selector) != exist) {
-                return;
-            }
-            observer.disconnect();
-            resolve(undefined);
-        });
-
-        observer.observe(parent, {
-            childList: true,
-            subtree: true,
-        });
-
-        if (!!parent.querySelector(selector) == exist) {
-            resolve(undefined);
-        }
-    });
+    return waitForEl(parent, selector, exist);
 };
 
 const inpaintAnything_waitForStyle = async (parent, selector, style) => {
@@ -123,35 +126,37 @@ async function inpaintAnything_clearSamMask() {
 
     const elemId = "#ia_sam_image";
 
-    const targetElement = document.querySelector(elemId);
+    const targetElement = root().querySelector(elemId);  // ⚠ use root()
     if (!targetElement) {
         return;
     }
-    await waitForElementToBeInDocument(targetElement, "button[aria-label='Clear']");
-
+    
+    // Reset styles
     targetElement.style.transform = null;
     targetElement.style.zIndex = null;
     targetElement.style.overflow = "auto";
 
-    const samMaskClear = targetElement.querySelector("button[aria-label='Clear']");
-    if (!samMaskClear) {
+    // ⚠ Find clear button using regex instead of exact text
+    const clearBtn = queryBtn(targetElement, /clear/i);
+    if (clearBtn) {
+        clearBtn.click();
+    }
+    
+    // ⚠ Find remove button using regex instead of exact text
+    const removeBtn = queryBtn(targetElement, /remove/i);
+    if (!removeBtn) {
         return;
     }
-    const removeImageButton = targetElement.querySelector("button[aria-label='Remove Image']");
-    if (!removeImageButton) {
-        return;
-    }
-    samMaskClear?.click();
-
+    
     if (typeof inpaintAnything_clearSamMask.clickRemoveImage === "undefined") {
         inpaintAnything_clearSamMask.clickRemoveImage = () => {
             targetElement.style.transform = null;
             targetElement.style.zIndex = null;
         };
     } else {
-        removeImageButton.removeEventListener("click", inpaintAnything_clearSamMask.clickRemoveImage);
+        removeBtn.removeEventListener("click", inpaintAnything_clearSamMask.clickRemoveImage);
     }
-    removeImageButton.addEventListener("click", inpaintAnything_clearSamMask.clickRemoveImage);
+    removeBtn.addEventListener("click", inpaintAnything_clearSamMask.clickRemoveImage);
 }
 
 async function inpaintAnything_clearSelMask() {
@@ -160,25 +165,27 @@ async function inpaintAnything_clearSelMask() {
 
     const elemId = "#ia_sel_mask";
 
-    const targetElement = document.querySelector(elemId);
+    const targetElement = root().querySelector(elemId);  // ⚠ use root()
     if (!targetElement) {
         return;
     }
-    await waitForElementToBeInDocument(targetElement, "button[aria-label='Clear']");
 
+    // Reset styles
     targetElement.style.transform = null;
     targetElement.style.zIndex = null;
     targetElement.style.overflow = "auto";
 
-    const selMaskClear = targetElement.querySelector("button[aria-label='Clear']");
-    if (!selMaskClear) {
+    // ⚠ Find clear button using regex instead of exact text
+    const clearBtn = queryBtn(targetElement, /clear/i);
+    if (clearBtn) {
+        clearBtn.click();
+    }
+    
+    // ⚠ Find remove button using regex instead of exact text
+    const removeBtn = queryBtn(targetElement, /remove/i);
+    if (!removeBtn) {
         return;
     }
-    const removeImageButton = targetElement.querySelector("button[aria-label='Remove Image']");
-    if (!removeImageButton) {
-        return;
-    }
-    selMaskClear?.click();
 
     if (typeof inpaintAnything_clearSelMask.clickRemoveImage === "undefined") {
         inpaintAnything_clearSelMask.clickRemoveImage = () => {
@@ -186,9 +193,9 @@ async function inpaintAnything_clearSelMask() {
             targetElement.style.zIndex = null;
         };
     } else {
-        removeImageButton.removeEventListener("click", inpaintAnything_clearSelMask.clickRemoveImage);
+        removeBtn.removeEventListener("click", inpaintAnything_clearSelMask.clickRemoveImage);
     }
-    removeImageButton.addEventListener("click", inpaintAnything_clearSelMask.clickRemoveImage);
+    removeBtn.addEventListener("click", inpaintAnything_clearSelMask.clickRemoveImage);
 }
 
 async function inpaintAnything_initSamSelMask() {
@@ -252,7 +259,7 @@ onUiLoaded(async () => {
         ia_out_image: "#ia_out_image",
         ia_cleaner_out_image: "#ia_cleaner_out_image",
         ia_webui_out_image: "#ia_webui_out_image",
-        ia_cn_out_image: "#ia_cn_out_image",
+        ia_cn_out_image: "#ia_cn_out_image"
     };
 
     function setStyleHeight(elemId, height) {
@@ -281,10 +288,12 @@ onUiLoaded(async () => {
     setStyleHeight(elementIDs.ia_cn_out_image, "520px");
 
     // Default config
-    const defaultHotkeysConfig = {
-        canvas_hotkey_reset: "KeyR",
-        canvas_hotkey_fullscreen: "KeyS",
-    };
+    //const defaultHotkeysConfig = {
+    //    canvas_hotkey_reset: "KeyR",
+    //    canvas_hotkey_fullscreen: "KeyS",
+    //};
+    const HOTKEY_RESET = "r";
+    const HOTKEY_FULLSCREEN = "s";
 
     const elemData = {};
     let activeElement;
@@ -398,7 +407,7 @@ onUiLoaded(async () => {
             //     targetElement.style.height = canvas.style.height;
             // }
             targetElement.style.width = null;
-            targetElement.style.height = 480;
+            targetElement.style.height = (CANVAS_H + 2*PAD) || (749 + 40) + "px"; // ⚠ Match height from Python code
         }
 
         /**
@@ -469,8 +478,8 @@ onUiLoaded(async () => {
             toggleOverlap("on");
         }
 
-        // Reset zoom when uploading a new image
-        const fileInput = gradioApp().querySelector(`${elemId} input[type="file"][accept="image/*"].svelte-116rqfv`);
+        // Reset zoom when uploading a new image (updated for Gradio 4)
+        const fileInput = gradioApp().querySelector(`${elemId} input[type="file"]`);
         if (fileInput) {
             fileInput.addEventListener("click", resetZoom);
         }
@@ -491,12 +500,16 @@ onUiLoaded(async () => {
                 return;
             }
 
-            const hotkeyActions = {
-                [defaultHotkeysConfig.canvas_hotkey_reset]: resetZoom,
-                [defaultHotkeysConfig.canvas_hotkey_fullscreen]: fitToScreen,
-            };
-
-            const action = hotkeyActions[event.code];
+            //const hotkeyActions = {
+            //    [defaultHotkeysConfig.canvas_hotkey_reset]: resetZoom,
+            //    [defaultHotkeysConfig.canvas_hotkey_fullscreen]: fitToScreen,
+            //};
+            const k = event.key.toLowerCase();
+            let action = null;
+            if (k === HOTKEY_RESET)        action = resetZoom;
+            else if (k === HOTKEY_FULLSCREEN) action = fitToScreen;
+            //const action = hotkeyActions[event.code];
+            
             if (action) {
                 event.preventDefault();
                 action(event);
