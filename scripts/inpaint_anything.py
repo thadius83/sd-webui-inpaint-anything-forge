@@ -17,6 +17,7 @@ import cv2, numpy as np, gradio as gr, torch
 from PIL import Image, ImageFilter, ImageOps
 from PIL.PngImagePlugin import PngInfo
 from torchvision import transforms
+from torch.hub import download_url_to_file
 
 # ‑‑‑ Web‑UI / diffusers ------------------------------------------------------
 from diffusers import (
